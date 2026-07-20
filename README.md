@@ -1,156 +1,268 @@
-# 途蛙记忆卡逆向
+# HD 电子书文件格式解析 (.hd)
 
-## 设备说明
+> 逆向分析墨水屏电子书阅读器的 `.hd` 文件格式
 
-本设备并非Android设备。 最新系统固件为： http://p.s3.tuwa.starot.com/firmware/study_v2_channel/01.02.02.61/xr_system_gen2.img
-定制设备固件基本没改造可能。可以理解为换了墨水屏幕的MP4。
+## 概述
 
-防止厂家倒闭、跑路、消失，故进行逆向。省的白花钱。
+`.hd` 是一种专用于墨水屏电子书阅读器的二进制文件格式，支持文本、音频（MP3）和元数据。文件分为单章节（有声书）和多章节（诗词集）两种变体。
 
-## 交互协议
+---
 
-### 设备注册
+## 文件结构
 
-```shell
-curl --location --request POST 'http://prod.study.tuwa.starot.com/wms/token?sn=xxxxx&code=CD919f&secret=xxxxxxx'
+### 整体布局
+
 ```
- - sn 设备序列号
- - code 未知
- - secret 未知
+┌─────────────────────────────────────────────────────────────────┐
+│ 0x0000      文件头 (44 字节)                                    │
+│ 0x002C      元数据段表                                          │
+│ 0x0060      索引/目录区                                         │
+│ 0x0088      诗词偏移数组                                        │
+│ ...         诗词描述块                                          │
+│ ...         字符串池                                            │
+│ ...         正文数据区（含 33 字节自定义编码头部）               │
+│ ...         MP3 音频数据（分段存储）                             │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-返回：
+### 1. 文件头 (44 字节)
 
-```json
-{
-    "code": 200,
-    "message": "请求成功",
-    "data": {
-        "token": "此处可以获取token",
-        "expired": 1753947348,
-        "base": "http://p.s3.tuwa.starot.com"
+| 偏移 | 大小 | 字段 | 说明 |
+|------|------|------|------|
+| 0x00 | 4 | `file_id` | 文件标识 |
+| 0x04 | 4 | `field_4` | 保留 |
+| 0x08 | 4 | `hash1` | 完整性校验 |
+| 0x0C | 4 | `hash2` | 完整性校验 |
+| 0x10 | 2 | `version_major` | 主版本号 |
+| 0x12 | 2 | `version_minor` | 次版本号 |
+| 0x14 | 2 | `version_build` | 构建号 |
+| 0x16 | 2 | `version_rev` | 修订号 |
+| 0x18 | 4 | `field_18` | 保留 |
+| 0x1C | 4 | `poem_count` | 诗词/章节数量 |
+| 0x20 | 4 | `data_size` | 数据区大小 |
+| 0x24 | 4 | `field_24` | 保留 |
+| 0x28 | 4 | `field_28` | 保留 |
+
+### 2. 元数据段表
+
+```c
+struct MetaEntry {
+    uint32_t ptr;      // 字符串偏移
+    uint16_t type;     // 类型
+    uint16_t seq;      // 序号
+    uint32_t size;     // 大小（含 null 终止符）
+};
+```
+
+- 起始偏移：`0x2C` 处的 `meta_count` 指定条目数
+- 每个条目 **12 字节**
+- 常见元数据：书名、分类、版本
+
+### 3. 索引/目录区 (0x60-0x88)
+
+| 文件类型 | 结构 |
+|---------|------|
+| **单章节** | 简单索引：`[字符串池偏移(4)] [诗词块偏移(4)]` |
+| **多章节** | 目录条目：`[ptr(4) + type(2) + count(2) + size(4)]` × N |
+
+### 4. 诗词偏移数组
+
+- 起始偏移：**0x88**
+- 每个偏移 **4 字节**（uint32 little-endian）
+- 数量 = `poem_count`
+
+### 5. 诗词描述块
+
+```c
+struct PoemBlock {
+    uint32_t entry_count;  // 条目数量
+    Entry entries[];       // 变长数组
+};
+
+struct Entry {
+    uint8_t  type;     // 0x01=UINT32, 0x02=STRING, 0x04=AUDIO
+    uint8_t  sub;      // 子类型
+    uint16_t id;       // 字段标识
+    uint32_t param1;   // 参数1（字符串长度/数值大小）
+    uint32_t param2;   // 参数2（字符串偏移/数值偏移/音频偏移）
+};
+```
+
+每个条目 **12 字节**。
+
+#### 字段 ID 语义
+
+| ID | 含义 |
+|-----|------|
+| 0x0190 | 标题 |
+| 0x0191 | 作者 |
+| 0x0192 | 段落数（UINT32） |
+| 0x0193 | 朝代/分类 |
+| 0x0194 | 音频/图片数据 |
+| 0x0196 | 描述 |
+| 0x0197 | 简介 |
+| 0x07D0+N | 原文第 N 段 |
+| 0x0FA0+N | 译文第 N 段 |
+| 0x1388+N | 注释第 N 条 |
+
+### 6. 字符串池
+
+- 存储标题、作者、分类等短字符串
+- 以 **null 字节**终止
+- UTF-8 编码
+
+### 7. 正文数据区（关键发现）
+
+#### 33 字节自定义编码头部
+
+对于 `id >= 0x07D0` 的文本条目（正文、译文、注释），数据格式为：
+
+```
+[33 字节头部] + [UTF-8 文本] + [0x00]
+```
+
+- **33 字节 = 11 个字符 × 3 字节/字符**
+- 编码方式：**自定义固定长度编码**（非 UTF-8）
+- **位置相关**：同一字符在不同位置编码不同
+- 跳过 33 字节后，后续为标准 UTF-8 中文文本
+
+> ⚠️ **未解决**：33 字节头部的具体编码/加密算法尚未逆向成功。
+
+#### 示例（条目3）
+
+| 部分 | 数据 | 说明 |
+|------|------|------|
+| 头部 | `2D 62 B1 02 C8 63 ...` (33 字节) | 自定义编码 |
+| 文本 | `的父亲，他是个教师...` | UTF-8 |
+
+### 8. MP3 音频数据
+
+#### 格式规格
+
+| 参数 | 值 |
+|------|-----|
+| 编码 | MPEG-1 Layer III |
+| 比特率 | 48 kbps |
+| 采样率 | 44100 Hz |
+| 声道 | 单声道 (mono) |
+| 帧大小 | 156-157 字节（含 padding） |
+
+#### 分段存储
+
+- **每首诗词/章节对应一段独立 MP3**
+- 通过 `type=0x04` 条目引用：`param1=音频大小`, `param2=音频偏移`
+- 段间有 **600~3800 字节间隔**，包含赏析/注释文本
+
+#### 间隔数据结构
+
+```
+[4-7 字节头部] + [UTF-8 赏析文本] + [0x00]
+```
+
+---
+
+## 文件类型对比
+
+| 特性 | 单章节（有声书） | 多章节（诗词集） |
+|------|----------------|----------------|
+| `poem_count` | 1 | N（如 75） |
+| 目录结构 | 简单索引 | 多目录条目 |
+| 音频 | 1 段 MP3 | N 段独立 MP3 |
+| 正文头部 | 33 字节 | 33 字节 |
+| 间隔数据 | 无 | 含赏析文本 |
+| 示例 | 穷爸爸富爸爸 | 小学生必背古诗词75首 |
+
+---
+
+## 固件信息
+
+- **芯片**: 全志 (AllWinner) ARM Cortex-M
+- **固件签名**: `AWIH`
+- **音频编码**: FFmpeg / LAME3.101
+- **文本常量**: 固件中大量出现 `mov r0, #33`（115 处），证实 33 为关键常量
+
+---
+
+## 已知问题与待解决项
+
+| 优先级 | 问题 | 状态 |
+|--------|------|------|
+| 🔴 高 | 33 字节头部编码算法 | ❌ 未解决 |
+| 🟡 中 | 文件头 hash 计算方式 | ❌ 未解决 |
+| 🟡 中 | 音频段间隔头部格式 | ⚠️ 部分解决 |
+| 🟢 低 | 目录索引区完整语义 | ⚠️ 部分解决 |
+
+---
+
+## 参考代码片段
+
+### 解析文本条目（含 33 字节头部跳过）
+
+```javascript
+if (etype === 0x02) {
+    let textOffset = param2;
+    let textMaxLen = param1 - 1;
+
+    // 正文/译文/注释有 33 字节自定义编码头部
+    if (eid >= 0x07D0) {
+        textOffset += 33;
+        textMaxLen -= 33;
     }
+
+    entry.text = readString(textOffset, textMaxLen);
 }
 ```
 
-### 资源推送
+### 解析 MP3 帧头
 
-```shell
-curl --location --request GET 'http://prod.study.tuwa.starot.com/wms/wait/download?cId=6&offset=0&size=3' \
---header 'Authorization: '\''Bearer '\''有效token' \
-```
- - cId 待下载类别 1 单词本 6 电子书
- - offset
- - size
+```javascript
+function parseMp3FrameHeader(data, offset) {
+    if (data[offset] !== 0xFF) return null;
+    if ((data[offset + 1] & 0xE0) !== 0xE0) return null;
 
-当存在待下载项目时，返回结果示例：
+    const versionId = (data[offset + 1] >> 3) & 0x3;  // 3 = MPEG-1
+    const layer = (data[offset + 1] >> 1) & 0x3;      // 1 = Layer III
+    const brIdx = (data[offset + 2] >> 4) & 0xF;
+    const srIdx = (data[offset + 2] >> 2) & 0x3;
+    const pad = (data[offset + 2] >> 1) & 0x1;
 
-```json
-{
-    "code": 200,
-    "message": "请求成功",
-    "data": {
-        "total": 1,
-        "list": [
-            {
-                "pushId": 263334,
-                "bookId": 23402,
-                "url": "/book/custom_v1/<userid>/ebook_<timestamp>.hd"
-                "size": 584854,
-                "planId": 0,
-                "study": null,
-                "review": null,
-                "updateTime": 1751354646,
-                "pressId": null,
-                "press": null,
-                "time": 1751354654,
-                "type": 2,
-                "name": "威尔历险记",
-                "count": 200726,
-                "studyMode": 0
-            }
-        ]
-    }
+    const bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+    const sampleRates = [44100, 48000, 32000, 0];
+
+    const bitrate = bitrates[brIdx] * 1000;
+    const sampleRate = sampleRates[srIdx];
+    const frameSize = Math.floor(144 * bitrate / sampleRate) + pad;
+
+    return { bitrate, sampleRate, frameSize, padding: pad };
 }
 ```
-则下载链接为：
-```
-http://p.s3.tuwa.starot.com/book/custom_v1/<userid>/ebook_<timestamp>.hd
-```
-书籍格式为txt，仅仅扩展名改为了".hd"。下载不需要token验证（亦即说不定可以下载别人上传的书）
 
-## 单词本的生成
+---
 
-单词本最终由com.funky.STBookGenerator调用```STBookGeneratorLib.so```生成。最后如果实现不行，就自己写一个apk来进行生成。
+## 制作 .hd 文件的最小可行方案
 
-### 流程
+1. **以现有文件为模板**，复制文件头结构
+2. **替换内容**：歌词文本、歌曲音频、元数据
+3. **MP3 编码**：`ffmpeg -i input.mp3 -ar 44100 -ac 1 -b:a 48k output.mp3`
+4. **跳过 33 字节头部**：歌词正文直接放 UTF-8（设备可能兼容）
+5. **hash 字段**：复制原值或填 0 测试
+6. **设备验证**：实际测试文件是否能被识别和播放
 
- 1. 触发点: 保存操作由 STAICardCustomBookSaveWordAct.N() 方法发起。这个方法很可能是在用户点击“保存”按钮时被调用的。
- 2. 核心组件: 保存的核心逻辑依赖于 com.funky.STBookGenerator 这个类。特别是它的一个 native 方法：generateHashRecord(JJIILjava/lang/String;)I。
- 3. 数据流: generateHashRecord 方法本身并不直接接收单词列表。相反，它通过一个回调机制（Listener）来按需获取数据。
-       * 在调用 generateHashRecord 之前，代码通过 new-instance v4, Lcom/starot/tuwa/ui/aicard/activity/h0; 创建了一个监听器。
-       * 然后通过 invoke-virtual {v1, v4}, Lcom/funky/STBookGenerator;->setListener(Lcom/funky/STBookGenerator$Listener;)V 将监听器设置给了 STBookGenerator 实例。
-       * 这个监听器 h0 实现了 com/funky/STBookGenerator$Listener 接口，该接口包含两个关键的回调方法：getWord(I)Ljava/lang/String; 和 getMeta()Ljava/lang/String;。
- 4. `generateHashRecord` 的工作方式:
-       * 它接收了单词列表 N 的大小作为参数 (iget-object v1, p0, ...->N; ... invoke-virtual {v1}, Ljava/util/ArrayList;->size()I)。
-       * native C++ 代码会根据传入的 size，循环调用 Java 层的 getWord(int index) 回调方法，一次获取一个单词的数据。
-       * 它还会调用 getMeta() 方法来获取这本书的元数据（比如书名、ID等）。
-       * native 代码拿到这些字符串后，会将它们处理并写入到最终的文件中（路径由最后一个参数指定，即 K 字段）。方法名 generateHashRecord
-         暗示了最终的文件格式可能是一个包含哈希索引的自定义二进制格式，以便于快速查找，而不仅仅是纯文本。
+> ⚠️ **风险**：如果设备严格校验 33 字节头部或 hash，文件可能无法加载。
 
-  单词列表 N 中的每个单词对象，在保存时会经过以下处理：
+---
 
-   1. STAICardCustomBookSaveWordAct 中的监听器（即 h0 实例）的回调方法 getWord(int index) 被 native 代码调用。
-   2. 该方法会从列表 N 中取出对应索引的单词对象。
-   3. 将该单词对象序列化成一个 JSON 格式的字符串。
-   4. 返回这个 JSON 字符串给 native 代码。
-   5. native 代码将收到的一个一个的 JSON 字符串，连同元数据（通过 getMeta 回调获取，同样是 JSON 格式），一起写入到一个自定义的、可能带有哈希索引的二进制文件（.hd 文件）中。
+## 相关文件
 
-### 单词读取
+| 文件 | 说明 |
+|------|------|
+| `穷爸爸富爸爸.txt` | 单章节有声书示例 |
+| `小学生必背古诗词75首.txt` | 多章节诗词集示例 |
+| `xr_system_gen2.txt` | 设备固件（ARM Cortex-M） |
+| `hd_editor.html` | 基于 Web 的 .hd 文件编辑器 |
 
-STBookGenerator.Listener 的具体实现，也就是 com/starot/tuwa/ui/aicard/activity/h0 这个类。
-getWord(I) 方法负责将 N 列表（STAICardCustomBookSaveWordAct中的N字段）中的单个单词对象 STAICardCustomBookWordModel 转换成一个JSON字符串。
+---
 
-  这个JSON字符串的格式如下：
-```json
-{
-   "word": "单词本身",
-   "symbols": [
-     {
-       "symbol": "音标字符串",
-       "url": "音标发音文件URL"
-     }
-   ],
-   "means": [
-     {
-       "mean": "词性. 释义"
-     }
-   ],
-   "sentences": [
-     {
-       "en": "例句的英文内容",
-       "zh": "例句的中文内容",
-       "en_url": "例句的英文发音URL"
-     }
-   ]
- }
-```
+## 许可证
 
-  字段说明:
-
-   * word: (String) 单词本身。
-   * symbols: (Array) 一个包含音标信息的数组。
-       * symbol: (String) 音标，例如 /wɜːd/。
-       * url: (String) 音标发音的音频文件地址。
-   * means: (Array) 一个包含单词释义的数组。
-       * mean: (String) 单词的释义，格式通常是“词性. 中文意思”，例如 "n. 单词；话语"。
-   * sentences: (Array) 一个包含例句的数组。
-       * en: (String) 英文例句。
-       * zh: (String) 例句的中文翻译。
-       * en_url: (String) 英文例句发音的音频文件地址。
-
-  要点:
-
-   * 代码逻辑显示，如果某个字段（如symbol）或某个数组（如sentences）没有内容，那么对应的键值对将不会出现在最终的JSON字符串中。
-   * getMeta() 方法也生成一个JSON字符串，用于描述整个词书的元数据，但它与单个单词的格式是分开的。
-
-
+MIT License - 仅供学习研究使用。
